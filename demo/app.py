@@ -277,7 +277,10 @@ if st.button('✨ 產生 AI 總體經濟摘要', type='primary'):
             from google import genai
             client = genai.Client(api_key=gemini_key)
             with st.spinner('Gemini 正在撰寫摘要…'):
-                response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+                response = client.models.generate_content(
+    model="gemini-3.8-flash",
+    contents=prompt
+)
             if response.text:
                 st.markdown(response.text)
             else:
