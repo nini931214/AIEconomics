@@ -274,7 +274,7 @@ if st.button('✨ 產生 AI 總體經濟摘要', type='primary'):
                   '新聞標題未驗證全文，不能把標題直接當因果證據；不得杜撰政策、數字、即時事件或確定的匯率預測。'
                   '如果資料不足，直接指出。\n\n資料：\n' + '\n'.join(context))
         try:
-            from google import genai
+            from google import gemini
             client = genai.Client(api_key=gemini_key)
             with st.spinner('Gemini 正在撰寫摘要…'):
                 response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
