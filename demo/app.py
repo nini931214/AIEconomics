@@ -1,106 +1,195 @@
-193
-194
-195
-196
-197
-198
-199
-200
-201
-202
-203
-204
-205
-206
-207
-208
-209
-210
-211
-212
-213
-214
-215
-216
-217
-218
-219
-220
-221
-222
-223
-224
-225
-226
-227
-228
-229
-230
-231
-232
-233
-234
-235
-236
-237
-238
-239
-240
-241
-242
-243
-244
-245
-246
-247
-248
-249
-250
-251
-252
-253
-254
-255
-256
-257
-258
-259
-260
-261
-262
-263
-264
-265
-266
-267
-268
-269
-270
-271
-272
-273
-274
-275
-276
-277
-278
-279
-280
-281
-282
-283
-284
-285
-286
-287
-288
-289
-290
-291
-292
-293
-294
-295
+import os
+from datetime import datetime, timedelta, timezone
+import xml.etree.ElementTree as ET
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+import yfinance as yf
+from fredapi import Fred
+
+st.set_page_config(page_title='全球總體經濟與匯率儀表板', page_icon='🌐', layout='wide')
+st.title('🌐 全球總體經濟、債券與匯率分析儀表板')
+st.caption('FRED + Yahoo Finance + Google News RSS + Gemini｜資料頻率、日期與延遲請依來源確認；非投資建議')
+
+
+def secret(name):
+    try:
+        return st.secrets.get(name, os.getenv(name, ''))
+    except (FileNotFoundError, KeyError):
+        return os.getenv(name, '')
+
+st.sidebar.header('⚙️ 設定')
+fred_key = secret('FRED_API_KEY') or st.sidebar.text_input('FRED API Key', type='password')
+gemini_key = secret('GEMINI_API_KEY') or st.sidebar.text_input('Gemini API Key（摘要功能）', type='password')
+if st.sidebar.button('🔄 清除快取並重新抓取'):
+    st.cache_data.clear()
+    st.rerun()
+
+FRED_SERIES = {
+    '美國 CPI 指數': 'CPIAUCSL',
+    '美國 10 年期公債殖利率': 'DGS10',
+    '美國 2 年期公債殖利率': 'DGS2',
+    '美國失業率': 'UNRATE',
+    '聯邦基金有效利率': 'FEDFUNDS',
+    '日本 10 年期公債殖利率': 'IRLTLT01JPM156N',
+}
+MARKET_TICKERS = {
+    'S&P 500': '^GSPC',
+    '台灣加權指數': '^TWII',
+    '布蘭特原油期貨 (USD/桶)': 'BZ=F',
+    '黃金期貨 (USD/盎司)': 'GC=F',
+    'USD/TWD（1 美元＝台幣）': 'TWD=X',
+    'GBP/USD（1 英鎊＝美元）': 'GBPUSD=X',
+    'GBP/TWD（1 英鎊＝台幣）': 'GBPTWD=X',
+}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_fred_data(api_key):
+    fred = Fred(api_key=api_key)
+    series = {}
+    failures = {}
+    for label, code in FRED_SERIES.items():
+        try:
+            s = fred.get_series(code, observation_start=(datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d'))
+            s.index = pd.to_datetime(s.index)
+            series[label] = pd.to_numeric(s, errors='coerce')
+        except Exception as exc:
+            failures[label] = str(exc)
+    if not series:
+        raise RuntimeError(f'所有 FRED 指標均無法取得：{failures}')
+    df = pd.DataFrame(series).sort_index()
+    if {'美國 10 年期公債殖利率', '美國 2 年期公債殖利率'} <= set(df.columns):
+        # 先以原始觀測日對齊，再計算利差；避免用補值製造假觀測
+        df['10Y−2Y 利差（百分點）'] = df['美國 10 年期公債殖利率'] - df['美國 2 年期公債殖利率']
+    return df, failures
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_market_data():
+    result = {}
+    failures = {}
+    for label, ticker in MARKET_TICKERS.items():
+        try:
+            raw = yf.download(ticker, period='2y', interval='1d', auto_adjust=True, progress=False, threads=False)
+            if raw.empty:
+                raise ValueError('無行情')
+            close = raw['Close']
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            close.index = pd.to_datetime(close.index).tz_localize(None) if close.index.tz is not None else pd.to_datetime(close.index)
+            result[label] = pd.to_numeric(close, errors='coerce')
+        except Exception as exc:
+            failures[label] = str(exc)
+    if not result:
+        raise RuntimeError(f'所有市場行情均無法取得：{failures}')
+    df = pd.DataFrame(result).sort_index()
+    # 若直盤不可用，可由兩個可取得的報價交叉推導；保留資料來源註記
+    cross = 'GBP/TWD（1 英鎊＝台幣）'
+    usd = 'USD/TWD（1 美元＝台幣）'
+    gbpusd = 'GBP/USD（1 英鎊＝美元）'
+    if usd in df and gbpusd in df:
+        derived = df[usd].ffill(limit=3) * df[gbpusd].ffill(limit=3)
+        if cross not in df or df[cross].dropna().empty:
+            df[cross] = derived
+            failures[cross] = '使用 GBP/USD × USD/TWD 交叉推算（非銀行成交價）'
+    return df, failures
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_news():
+    # Google News RSS 為公開新聞標題；無法保證涵蓋所有重大事件
+    queries = ['英鎊 台幣 美元 匯率 央行', 'Bank of England Federal Reserve Taiwan dollar exchange rate']
+    items = []
+    for query in queries:
+        try:
+            url = f'https://news.google.com/rss/search?q={quote(query)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant'
+            req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urlopen(req, timeout=8) as response:
+                root = ET.fromstring(response.read())
+            for item in root.findall('./channel/item')[:6]:
+                title = item.findtext('title', '').strip()
+                link = item.findtext('link', '').strip()
+                date = item.findtext('pubDate', '').strip()
+                if title and link:
+                    items.append({'title': title, 'url': link, 'published': date})
+        except Exception:
+            continue
+    seen = set()
+    unique = []
+    for item in items:
+        if item['url'] not in seen:
+            unique.append(item)
+            seen.add(item['url'])
+    return unique[:10]
+
+
+def last_obs(series):
+    s = series.dropna()
+    if s.empty:
+        return None, None, None
+    return float(s.iloc[-1]), pd.Timestamp(s.index[-1]), float(s.iloc[-2]) if len(s) >= 2 else None
+
+
+def metric(column, label, df, key, suffix='', digits=2):
+    if key not in df:
+        column.metric(label, '無資料')
+        return
+    value, date, previous = last_obs(df[key])
+    if value is None:
+        column.metric(label, '無資料')
+        return
+    delta = f'{value-previous:+.{digits}f}{suffix}' if previous is not None else None
+    column.metric(label, f'{value:,.{digits}f}{suffix}', delta, help=f'最近觀測日：{date.date()}；delta 為前一筆有效觀測差')
+
+
+def scenario(series, horizon=30):
+    # 歷史波動率推算的情境區間，不是具預測能力的信賴區間
+    s = series.dropna()
+    r = np.log(s / s.shift(1)).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(r) < 40:
+        return None
+    spot = float(s.iloc[-1])
+    sigma = float(r.tail(90).std())
+    scale = sigma * np.sqrt(horizon)
+    return {'spot': spot, 'low': spot * np.exp(-1.96 * scale), 'high': spot * np.exp(1.96 * scale), 'sigma': sigma}
+
+with st.spinner('正在取得最新可用資料…'):
+    macro_df, macro_errors = (get_fred_data(fred_key) if fred_key else (pd.DataFrame(), {}))
+    try:
+        market_df, market_errors = get_market_data()
+    except Exception as exc:
+        market_df, market_errors = pd.DataFrame(), {'市場行情': str(exc)}
+
+if not fred_key:
+    st.info('輸入 FRED API Key 可開啟總經數據與殖利率曲線；市場資料與新聞仍可使用。')
+
+st.subheader('📊 核心經濟指標')
+if not macro_df.empty:
+    cols = st.columns(4)
+    metric(cols[0], '美國 CPI（指數，非通膨率）', macro_df, '美國 CPI 指數', digits=1)
+    metric(cols[1], '美國 10 年債殖利率', macro_df, '美國 10 年期公債殖利率', '%')
+    metric(cols[2], '美國失業率', macro_df, '美國失業率', '%', 1)
+    metric(cols[3], '聯邦基金有效利率', macro_df, '聯邦基金有效利率', '%')
+    cols = st.columns(2)
+    metric(cols[0], '日本 10 年債殖利率（月資料）', macro_df, '日本 10 年期公債殖利率', '%')
+    metric(cols[1], '美債 10Y−2Y 利差', macro_df, '10Y−2Y 利差（百分點）', ' 個百分點')
+
+st.subheader('🚦 美國公債殖利率曲線警示')
+spread_key = '10Y−2Y 利差（百分點）'
+if spread_key in macro_df and not macro_df[spread_key].dropna().empty:
+    spread = macro_df[spread_key].dropna()
+    val, obs_date, _ = last_obs(spread)
+    if val < 0:
+        st.error(f'🔴 Warning：美債殖利率曲線倒掛！10Y−2Y = {val:.2f} 個百分點（{obs_date.date()}）。倒掛是風險訊號，並非衰退保證。')
+    else:
+        st.success(f'🟢 最近觀測利差為 {val:.2f} 個百分點（{obs_date.date()}），未倒掛。')
+    fig = px.line(spread.rename('利差'), title='美國 10 年期 − 2 年期公債殖利率')
+    fig.add_hline(y=0, line_dash='dash', line_color='red')
+    fig.update_layout(yaxis_title='百分點', xaxis_title='觀測日期', hovermode='x unified')
+    st.plotly_chart(fig, use_container_width=True)
 else:
     st.info('取得 DGS10 與 DGS2 後會顯示倒掛燈號與歷史圖。')
 
