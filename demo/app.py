@@ -1,4 +1,9 @@
 import os
+import json
+import sqlite3
+import tempfile
+import time
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
@@ -26,6 +31,7 @@ def secret(name):
 st.sidebar.header('⚙️ 設定')
 fred_key = secret('FRED_API_KEY') or st.sidebar.text_input('FRED API Key', type='password')
 gemini_key = secret('GEMINI_API_KEY') or st.sidebar.text_input('Gemini API Key（摘要功能）', type='password')
+gemini_model = secret('GEMINI_MODEL') or 'gemini-3.8-flash'
 if st.sidebar.button('🔄 清除快取並重新抓取'):
     st.cache_data.clear()
     st.rerun()
@@ -248,16 +254,93 @@ if news:
 else:
     st.warning('目前無法讀取新聞 RSS；請稍後刷新。')
 
+# SQLite 僅保存在 Streamlit 目前執行環境；重新部署可能遺失。
+DB_PATH = Path(tempfile.gettempdir()) / 'aieconomics_gemini_history.sqlite3'
+
+
+def init_history():
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            model TEXT NOT NULL,
+            summary TEXT NOT NULL
+        )''')
+
+
+def save_history(model, summary):
+    created_at = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S %z')
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        conn.execute('INSERT INTO summaries (created_at, model, summary) VALUES (?, ?, ?)',
+                     (created_at, model, summary))
+    return created_at
+
+
+def load_history():
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        return conn.execute(
+            'SELECT id, created_at, model, summary FROM summaries ORDER BY id DESC'
+        ).fetchall()
+
+
+def delete_history(record_id):
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        conn.execute('DELETE FROM summaries WHERE id = ?', (record_id,))
+
+
+def call_gemini_with_retry(api_key, model, prompt, max_attempts=3):
+    from google import genai
+    from google.genai import errors
+    client = genai.Client(api_key=api_key)
+    status = st.empty()
+    try:
+        for attempt in range(max_attempts):
+            try:
+                status.info(f'Gemini 正在生成摘要（第 {attempt + 1}/{max_attempts} 次）…')
+                response = client.models.generate_content(model=model, contents=prompt)
+                content = (response.text or '').strip()
+                if not content:
+                    raise ValueError('Gemini 未回傳文字，可能受到內容安全限制。')
+                return content
+            except (errors.ServerError, errors.ClientError) as exc:
+                code = getattr(exc, 'code', None)
+                if code is None:
+                    code = getattr(exc, 'status_code', None)
+                try:
+                    code = int(code)
+                except (TypeError, ValueError):
+                    code = None
+                # 429、500、502、503、504 才重試；400、401、403、404 直接回報
+                if code not in (429, 500, 502, 503, 504) or attempt == max_attempts - 1:
+                    raise
+                wait_seconds = 2 ** (attempt + 1)
+                status.warning(f'Gemini 暫時無法服務（HTTP {code}），{wait_seconds} 秒後重試…')
+                time.sleep(wait_seconds)
+    finally:
+        status.empty()
+        client.close()
+
+
 st.subheader('🤖 Gemini AI 總體經濟摘要')
-st.caption('按下按鈕後才會呼叫 Gemini。摘要包含最新觀測值與日期、利差警示、匯率與新聞標題；不保證市場預測準確。')
+st.caption('使用最新可用數據與新聞標題生成約 200 字短評；新聞標題未核實全文，不能視為市場因果證據。')
+
+try:
+    init_history()
+    history_available = True
+except (OSError, sqlite3.Error) as exc:
+    history_available = False
+    st.warning(f'目前無法使用歷史紀錄儲存：{exc}')
+
 if st.button('✨ 產生 AI 總體經濟摘要', type='primary'):
     if not gemini_key:
-        st.warning('請先在側邊欄或 .streamlit/secrets.toml 設定 GEMINI_API_KEY。')
+        st.warning('請先在 Streamlit Secrets 設定 GEMINI_API_KEY。')
     elif macro_df.empty:
-        st.warning('需要 FRED API Key 與可用總經資料，才能產生摘要。')
+        st.warning('需要有效的 FRED API Key 與總經資料才能產生摘要。')
     else:
         context = []
-        for key in ['美國 CPI 指數', '美國失業率', '美國 10 年期公債殖利率', '美國 2 年期公債殖利率', '聯邦基金有效利率', '日本 10 年期公債殖利率', spread_key]:
+        for key in ['美國 CPI 指數', '美國失業率', '美國 10 年期公債殖利率',
+                    '美國 2 年期公債殖利率', '聯邦基金有效利率',
+                    '日本 10 年期公債殖利率', spread_key]:
             if key in macro_df:
                 value, dt, _ = last_obs(macro_df[key])
                 if value is not None:
@@ -267,26 +350,54 @@ if st.button('✨ 產生 AI 總體經濟摘要', type='primary'):
                 value, dt, _ = last_obs(market_df[key])
                 if value is not None:
                     context.append(f'{key}: {value:.4f}（行情日 {dt.date()}）')
-        context.extend('新聞標題（未核實全文）：' + x['title'] + ' / ' + x['published'] for x in news[:5])
-        prompt = ('請以繁體中文撰寫約 200 個中文字的總體經濟短評，重點是美國通膨、就業、利率、10Y−2Y 利差，'
-                  '以及美元/台幣與英鎊/台幣的連動，兼顧英國留學換匯者。務必區分各指標觀測日與新聞日期；'
-                  'CPI 指數不是通膨率，日本殖利率為月頻，不能稱為即時數值；'
-                  '新聞標題未驗證全文，不能把標題直接當因果證據；不得杜撰政策、數字、即時事件或確定的匯率預測。'
-                  '如果資料不足，直接指出。\n\n資料：\n' + '\n'.join(context))
+        context.extend('新聞標題（未核實全文）：' + x['title'] + ' / ' + x['published']
+                       for x in news[:5])
+        prompt = (
+            '請以繁體中文撰寫約 200 個中文字的總體經濟短評，重點是美國通膨、就業、利率、'
+            '10Y−2Y 利差，以及美元/台幣與英鎊/台幣的連動，兼顧英國留學換匯者。'
+            '務必區分各指標觀測日與新聞日期；CPI 指數不是通膨率，日本殖利率為月頻；'
+            '新聞標題未驗證全文，不能把標題直接當因果證據；'
+            '不得杜撰政策、數字、即時事件或確定的匯率預測。資料不足請明確指出。'
+            '\n\n資料：\n' + '\n'.join(context)
+        )
         try:
-            from google import genai
-            client = genai.Client(api_key=gemini_key)
-            with st.spinner('Gemini 正在撰寫摘要…'):
-                response = client.models.generate_content(
-    model="gemini-3.8-flash",
-    contents=prompt
-)
-            if response.text:
-                st.markdown(response.text)
-            else:
-                st.warning('Gemini 沒有回傳文字，請稍後再試。')
+            summary = call_gemini_with_retry(gemini_key, gemini_model, prompt)
+            st.success('摘要產生成功！')
+            st.markdown(summary)
+            if history_available:
+                try:
+                    created_at = save_history(gemini_model, summary)
+                    st.caption(f'已加入歷史紀錄｜{created_at}')
+                except (OSError, sqlite3.Error) as exc:
+                    st.warning(f'摘要成功，但無法寫入歷史紀錄：{exc}')
         except Exception as exc:
-            st.error(f'Gemini 呼叫失敗：{exc}')
+            st.error(f'Gemini 呼叫失敗：{type(exc).__name__}: {exc}')
+            st.info('若為 503，代表模型服務暫時繁忙；若為 404，請確認目前帳號可用的模型名稱。')
+
+st.subheader('🗂️ AI 摘要歷史紀錄')
+st.caption('紀錄儲存在此 Streamlit 執行環境的暫存資料庫；重新部署、容器重建或休眠恢復可能遺失。請下載備份。')
+if history_available:
+    try:
+        records = load_history()
+        if not records:
+            st.info('目前還沒有摘要紀錄。成功產生摘要後會自動新增。')
+        else:
+            st.write(f'目前有 {len(records)} 筆摘要紀錄')
+            export = [dict(id=r[0], created_at=r[1], model=r[2], summary=r[3]) for r in records]
+            st.download_button('⬇️ 下載全部歷史紀錄（JSON）',
+                               data=json.dumps(export, ensure_ascii=False, indent=2).encode('utf-8'),
+                               file_name='gemini_summary_history.json', mime='application/json')
+            for record_id, created_at, model, summary in records:
+                with st.expander(f'📅 {created_at}｜{model}｜紀錄 #{record_id}'):
+                    st.markdown(summary)
+                    st.download_button('下載此摘要（TXT）', data=summary,
+                                       file_name=f'gemini_summary_{record_id}.txt',
+                                       mime='text/plain', key=f'download_{record_id}')
+                    if st.button('🗑️ 刪除此筆紀錄', key=f'delete_{record_id}'):
+                        delete_history(record_id)
+                        st.rerun()
+    except (OSError, sqlite3.Error) as exc:
+        st.warning(f'讀取歷史紀錄失敗：{exc}')
 
 with st.expander('資料來源、缺漏與更新頻率'):
     st.markdown('FRED：美國 CPI／失業率／有效聯邦基金利率通常為月資料；DGS10、DGS2 通常為日資料；日本 10 年公債系列 IRLTLT01JPM156N 為月資料。Yahoo Finance 為市場參考行情，可能延遲或缺漏。新聞為 Google News RSS。')
