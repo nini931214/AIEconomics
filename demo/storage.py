@@ -61,8 +61,16 @@ def _endpoint(url: str) -> str:
 
 
 def _headers(key: str) -> dict:
-    return {'apikey': key, 'Authorization': 'Bearer ' + key,
-            'Content-Type': 'application/json', 'Prefer': 'return=minimal,resolution=ignore-duplicates'}
+    # Supabase's newer sb_secret_ keys are not JWTs: send in apikey only.
+    # Legacy service_role JWT keys also support Authorization: Bearer.
+    headers = {
+        'apikey': key,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=minimal,resolution=ignore-duplicates',
+    }
+    if not key.startswith('sb_secret_'):
+        headers['Authorization'] = 'Bearer ' + key
+    return headers
 
 
 def save_supabase(url: str, key: str, record: dict) -> None:
