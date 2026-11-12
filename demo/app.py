@@ -125,17 +125,29 @@ def get_market_data():
             failures[cross] = '使用 GBP/USD × USD/TWD 交叉推算（非銀行成交價）'
     return df, failures
 
-NEWS_QUERIES = [
-    '英鎊 台幣 美元 匯率 央行',
-    'Bank of England Federal Reserve Taiwan dollar exchange rate',
-]
-# 課堂要求：動態輸入關鍵字，quote() 正確處理中文和特殊符號。
+
+# 新聞來源：將原本過長的 AND 查詢，拆成易找到最新報導的主題。
+# Google News RSS 非推播；when:7d 是搜尋範圍，不代表每篇文章都會即時收錄。
+NEWS_SOURCES = (
+    ('台灣匯率', '新台幣 匯率 when:7d', 'zh-TW', 'TW', 'TW:zh-Hant'),
+    ('美國央行', '聯準會 利率 when:7d', 'zh-TW', 'TW', 'TW:zh-Hant'),
+    ('美國通膨', '美國 通膨 when:7d', 'zh-TW', 'TW', 'TW:zh-Hant'),
+    ('英國央行', '英國央行 英鎊 when:7d', 'zh-TW', 'TW', 'TW:zh-Hant'),
+    ('Fed News', 'Federal Reserve interest rates when:7d', 'en-US', 'US', 'US:en'),
+    ('BoE News', 'Bank of England pound when:7d', 'en-GB', 'GB', 'GB:en'),
+)
 custom_news_query = st.sidebar.text_input(
     '📰 自訂新聞關鍵字', value='',
-    placeholder='例如：聯準會 利率 通膨',
-    help='可額外追蹤自己研究的新聞主題；每 2 分鐘檢查，不保證來源即時發布。',
+    placeholder='例如：台灣 CPI 或央行 利率',
+    help='額外追蹤指定關鍵字；會和其他主題一起檢查 Google News RSS。',
 ).strip()
-active_news_queries = tuple(NEWS_QUERIES + ([custom_news_query[:100]] if custom_news_query else []))
+active_news_sources = list(NEWS_SOURCES)
+if custom_news_query:
+    query = custom_news_query[:100]
+    if 'when:' not in query.lower():
+        query += ' when:7d'
+    active_news_sources.append(('自訂主題', query, 'zh-TW', 'TW', 'TW:zh-Hant'))
+active_news_sources = tuple(active_news_sources)
 TW = timezone(timedelta(hours=8))
 
 
@@ -149,16 +161,23 @@ def parse_news_time(raw):
         return None
 
 
-def fetch_one_feed(query):
-    """urllib 網路請求加上 timeout；交由 feedparser 解析 RSS（課堂要求）。"""
-    url = f'https://news.google.com/rss/search?q={quote(query)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant'
-    req = Request(url, headers={'User-Agent': 'Mozilla/5.0 (compatible; AIEconomics/3.0)'})
-    with urlopen(req, timeout=6) as response:
+def fetch_one_feed(source):
+    """逐一查詢 Google News RSS，回傳主題名稱和可供去重排序的文章。"""
+    label, query, hl, gl, ceid = source
+    url = (
+        f'https://news.google.com/rss/search?q={quote(query, safe="")}'
+        f'&hl={hl}&gl={gl}&ceid={ceid}'
+    )
+    req = Request(url, headers={
+        'User-Agent': 'Mozilla/5.0 (compatible; AIEconomics/3.1)',
+        'Accept': 'application/rss+xml, application/xml;q=0.9, */*;q=0.7',
+    })
+    with urlopen(req, timeout=8) as response:
         feed = feedparser.parse(response.read())
     if feed.bozo and not feed.entries:
-        raise ValueError('RSS 格式錯誤或無資料')
+        raise ValueError('RSS 解析失敗')
     results = []
-    for entry in feed.entries[:12]:
+    for entry in feed.entries[:14]:
         title = str(entry.get('title', '')).strip()
         link = str(entry.get('link', '')).strip()
         raw_date = str(entry.get('published', '')).strip()
@@ -172,35 +191,51 @@ def fetch_one_feed(query):
             results.append({
                 'title': title,
                 'url': link,
-                'published': dt.strftime('%Y-%m-%d %H:%M') if dt else raw_date,
+                'published': dt.strftime('%Y-%m-%d %H:%M') if dt else (raw_date or '未提供日期'),
                 'published_ts': dt.timestamp() if dt else 0,
+                'topic': label,
             })
     return results
 
 
-@st.cache_data(ttl=120, show_spinner=False, max_entries=8)
-def get_news(queries):
-    """活躍工作階段每 120 秒檢查新標題，不等於 RSS 提供即時推播。"""
+def news_fingerprint(item):
+    """避免 Google News 同篇不同 URL 重複出現。"""
+    return re.sub(r'\s+-\s+[^-]+$', '', item['title']).strip().casefold() or item['url']
+
+
+@st.cache_data(ttl=100, show_spinner=False, max_entries=8)
+def get_news(sources):
+    """實際向 RSS 請求，回傳新聞、檢查時刻及連線狀態。"""
     checked_at = datetime.now(TW).strftime('%Y-%m-%d %H:%M:%S')
     items = []
-    succeeded = 0
-    with ThreadPoolExecutor(max_workers=min(len(queries), 3)) as pool:
-        futures = [pool.submit(fetch_one_feed, q) for q in queries]
-        for future in futures:
+    successes = 0
+    failed_labels = []
+    empty_labels = []
+    with ThreadPoolExecutor(max_workers=min(len(sources), 6)) as pool:
+        futures = [pool.submit(fetch_one_feed, source) for source in sources]
+        for source, future in zip(sources, futures):
             try:
-                items.extend(future.result())
-                succeeded += 1
+                batch = future.result()
+                items.extend(batch)
+                successes += 1
+                if not batch:
+                    empty_labels.append(source[0])
             except Exception as exc:
-                logging.warning('新聞 RSS 暫時讀取失敗：%s', type(exc).__name__)
-
-    seen = set()
+                failed_labels.append(source[0])
+                logging.warning('RSS 來源 %s 讀取失敗：%s', source[0], type(exc).__name__)
     unique = []
+    seen = set()
     for item in sorted(items, key=lambda x: x['published_ts'], reverse=True):
-        normalized = re.sub(r'\s+-\s+[^-]+$', '', item['title']).strip().casefold()
-        if normalized not in seen:
-            seen.add(normalized)
+        key = news_fingerprint(item)
+        if key not in seen:
+            seen.add(key)
             unique.append(item)
-    return unique[:12], checked_at, succeeded
+    diagnostics = {
+        'success': successes, 'total': len(sources),
+        'failed': failed_labels, 'empty': empty_labels,
+        'fetched_count': len(unique),
+    }
+    return unique[:18], checked_at, diagnostics
 
 
 def last_obs(series):
@@ -316,26 +351,61 @@ if not market_df.empty:
                 st.markdown(f"**30 個交易日歷史波動情境（非價格預測）：** 假設價格不變且日報酬波動延續，約為 **{sc['low']:.2f}–{sc['high']:.2f} TWD/GBP**；基準報價 {sc['spot']:.2f}。")
                 st.caption('採最近 90 筆日對數報酬標準差 × √30 與 ±1.96 倍波動幅度；未納入央行決策、突發新聞、趨勢漂移及極端風險，不能當作 95% 實際預測保證。')
 
+
 @st.fragment(run_every='120s')
 def show_live_news():
-    st.subheader('📰 每日財經時事與央行動向')
-    if st.button('🔄 立即檢查新聞', key='refresh_news'):
-        get_news.clear()  # 只清除新聞快取，不干擾 FRED / Yahoo 的快取
-    news, checked_at, succeeded = get_news(active_news_queries)
-    if news:
-        st.session_state['latest_news'] = news
+    st.subheader('📰 最新財經時事與央行動向')
+    st.caption('網站開啟期間每 2 分鐘檢查 RSS；可按按鈕強制重新查詢，不用重新整理整個頁面。')
+    manual_check = st.button('🔄 立即檢查新聞', key='refresh_news', use_container_width=False)
+    if manual_check:
+        get_news.clear()  # 強制跳過 100 秒新聞快取，保留 FRED / Yahoo 的快取。
+    if manual_check:
+        with st.spinner('正在向新聞來源重新查詢，並比對是否有新標題…'):
+            fetched, checked_at, diag = get_news(active_news_sources)
     else:
-        news = st.session_state.get('latest_news', [])
-    if succeeded == 0:
-        st.warning('RSS 來源暫時無法連線；下方如有新聞，為本次瀏覽期間的最近成功紀錄。')
+        fetched, checked_at, diag = get_news(active_news_sources)
+
+    old_news = st.session_state.get('latest_news', [])
+    old_keys = {news_fingerprint(item) for item in old_news}
+    news = fetched
+    if fetched:
+        st.session_state['latest_news'] = fetched
+        st.session_state['last_news_success_time'] = checked_at
+    elif old_news:
+        news = old_news  # 短暫斷線顯示上次成功取得的快照。
+    new_count = len([item for item in fetched if news_fingerprint(item) not in old_keys]) if old_news else 0
+
+    if manual_check:
+        if diag['success'] == 0:
+            st.error(f'檢查失敗：{diag["total"]} 個來源均無法連線。顯示的是上次成功抓取的新聞，請查看下方來源狀態。')
+        elif new_count:
+            st.success(f'已完成即時檢查！找到 {new_count} 則與上次顯示不同的新聞。')
+        else:
+            st.info('已重新連線檢查完成，但目前 RSS 提供的文章與上次顯示相同，並非按鈕沒有反應。')
+
+    st.caption(
+        f'最近實際檢查：{checked_at}（台灣時間）｜'
+        f'成功來源 {diag["success"]}/{diag["total"]}｜'
+        f'取得 {diag["fetched_count"]} 則不重複文章（最多顯示 18 則）'
+    )
+    if diag['failed']:
+        st.warning('本次無法連線的來源：' + '、'.join(diag['failed']))
+    if diag['success'] == 0 and news:
+        st.warning('以下是暫存的舊新聞；最近一次成功檢查：' + st.session_state.get('last_news_success_time', '不明'))
+
     if news:
+        newest = next((x for x in news if x.get('published_ts')), None)
+        if newest:
+            st.caption(f'目前最新文章發布時間：{newest["published"]}（台灣時間）；這與「檢查時間」不同。')
         for item in news:
-            date_label = ('台灣時間' if item['published_ts'] else '來源原始日期')
-            st.markdown(f"- [{item['title']}]({item['url']})  ·  {item['published']}（{date_label}）")
-        st.caption(f'最近檢查：{checked_at}（台灣時間）｜網頁開啟期間每 2 分鐘自動檢查。')
-        st.caption('採用 feedparser + urllib.parse.quote 抓取 Google News RSS。來源非即時推播，可能延遲或漏載。')
+            label = '台灣時間' if item.get('published_ts') else '來源日期未確認'
+            st.markdown(
+                f'- **[{item["title"]}]({item["url"]})**  ·  '
+                f'{item["published"]}（{label}） · {item.get("topic", "新聞來源")}'
+            )
     else:
-        st.warning('目前無法讀取新聞 RSS；可點「立即檢查新聞」稍後重試。')
+        st.warning('目前沒有抓到新聞。可能是來源未回應、近期沒有符合條件的文章，或 Google News RSS 尚未收錄。')
+    st.caption('Google News RSS 並非真正的即時新聞推播；新文章是否出現，取決於新聞發布及 Google 收錄時間。')
 
 
 show_live_news()
@@ -518,7 +588,7 @@ def show_ai_panel():
         else:
             latest_news = st.session_state.get('latest_news', [])
             if not latest_news:
-                latest_news, _, _ = get_news(active_news_queries)
+                latest_news, _, _ = get_news(active_news_sources)
             if not latest_news and macro_df.empty:
                 st.warning('新聞與 FRED 總經資料目前都不可用，請稍後重試。')
             else:
@@ -617,7 +687,7 @@ def show_ai_panel():
 show_ai_panel()
 
 with st.expander('資料來源、缺漏與更新頻率'):
-    st.markdown('FRED：美國 CPI／失業率／有效聯邦基金利率通常為月資料；DGS10、DGS2 通常為日資料；日本 10 年公債系列 IRLTLT01JPM156N 為月資料。Yahoo Finance 為市場參考行情，可能延遲或缺漏。新聞採用 feedparser 讀取 Google News RSS，開啟頁面時每 2 分鐘檢查一次；來源並非即時推播。')
+    st.markdown('FRED：美國 CPI／失業率／有效聯邦基金利率通常為月資料；DGS10、DGS2 通常為日資料；日本 10 年公債系列 IRLTLT01JPM156N 為月資料。Yahoo Finance 為市場參考行情，可能延遲或缺漏。新聞採用 feedparser 讀取 Google News RSS，開啟頁面時每 2 分鐘檢查一次，手動按鈕可強制跳過快取。搜尋條件為近 7 天，並非即時推播。')
     if macro_errors:
         st.warning('FRED 部分系列失敗：' + '；'.join(macro_errors.keys()))
     if market_errors:
