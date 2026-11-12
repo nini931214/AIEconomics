@@ -2,10 +2,14 @@ import os
 import json
 import sqlite3
 import tempfile
-import time
+import hashlib
+import logging
+import re
+from concurrent.futures import ThreadPoolExecutor
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-import xml.etree.ElementTree as ET
+import feedparser
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -16,6 +20,8 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 from fredapi import Fred
+from pydantic import BaseModel, Field
+from typing import Literal
 
 st.set_page_config(page_title='全球總體經濟與匯率儀表板', page_icon='🌐', layout='wide')
 st.title('🌐 全球總體經濟、債券與匯率分析儀表板')
@@ -31,7 +37,22 @@ def secret(name):
 st.sidebar.header('⚙️ 設定')
 fred_key = secret('FRED_API_KEY') or st.sidebar.text_input('FRED API Key', type='password')
 gemini_key = secret('GEMINI_API_KEY') or st.sidebar.text_input('Gemini API Key（摘要功能）', type='password')
-gemini_model = secret('GEMINI_MODEL') or 'gemini-3.8-flash'
+# 快速模式適合 200 字左右的短評；原本的 3.8 Flash 仍可選用。
+MODEL_CHOICES = ['gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-3.8-flash']
+configured_model = secret('GEMINI_MODEL')
+if configured_model and configured_model not in MODEL_CHOICES:
+    MODEL_CHOICES.append(configured_model)
+gemini_model = st.sidebar.selectbox(
+    'Gemini 摘要模型',
+    MODEL_CHOICES,
+    index=MODEL_CHOICES.index(configured_model) if configured_model else 0,
+    format_func=lambda name: {
+        'gemini-3.5-flash-lite': '⚡ 快速｜Gemini 3.5 Flash-Lite',
+        'gemini-3.5-flash': '🧠 課堂指定｜Gemini 3.5 Flash',
+        'gemini-3.8-flash': '🧠 進階｜Gemini 3.8 Flash',
+    }.get(name, name),
+    help='快速模式較適合短評；模型仍依你的 Gemini API 使用額度及可用性運作。',
+)
 if st.sidebar.button('🔄 清除快取並重新抓取'):
     st.cache_data.clear()
     st.rerun()
@@ -104,32 +125,82 @@ def get_market_data():
             failures[cross] = '使用 GBP/USD × USD/TWD 交叉推算（非銀行成交價）'
     return df, failures
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_news():
-    # Google News RSS 為公開新聞標題；無法保證涵蓋所有重大事件
-    queries = ['英鎊 台幣 美元 匯率 央行', 'Bank of England Federal Reserve Taiwan dollar exchange rate']
+NEWS_QUERIES = [
+    '英鎊 台幣 美元 匯率 央行',
+    'Bank of England Federal Reserve Taiwan dollar exchange rate',
+]
+# 課堂要求：動態輸入關鍵字，quote() 正確處理中文和特殊符號。
+custom_news_query = st.sidebar.text_input(
+    '📰 自訂新聞關鍵字', value='',
+    placeholder='例如：聯準會 利率 通膨',
+    help='可額外追蹤自己研究的新聞主題；每 2 分鐘檢查，不保證來源即時發布。',
+).strip()
+active_news_queries = tuple(NEWS_QUERIES + ([custom_news_query[:100]] if custom_news_query else []))
+TW = timezone(timedelta(hours=8))
+
+
+def parse_news_time(raw):
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(TW)
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def fetch_one_feed(query):
+    """urllib 網路請求加上 timeout；交由 feedparser 解析 RSS（課堂要求）。"""
+    url = f'https://news.google.com/rss/search?q={quote(query)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant'
+    req = Request(url, headers={'User-Agent': 'Mozilla/5.0 (compatible; AIEconomics/3.0)'})
+    with urlopen(req, timeout=6) as response:
+        feed = feedparser.parse(response.read())
+    if feed.bozo and not feed.entries:
+        raise ValueError('RSS 格式錯誤或無資料')
+    results = []
+    for entry in feed.entries[:12]:
+        title = str(entry.get('title', '')).strip()
+        link = str(entry.get('link', '')).strip()
+        raw_date = str(entry.get('published', '')).strip()
+        dt = parse_news_time(raw_date)
+        if not dt and entry.get('published_parsed'):
+            try:
+                dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).astimezone(TW)
+            except (TypeError, ValueError, OverflowError):
+                dt = None
+        if title and link.startswith(('http://', 'https://')):
+            results.append({
+                'title': title,
+                'url': link,
+                'published': dt.strftime('%Y-%m-%d %H:%M') if dt else raw_date,
+                'published_ts': dt.timestamp() if dt else 0,
+            })
+    return results
+
+
+@st.cache_data(ttl=120, show_spinner=False, max_entries=8)
+def get_news(queries):
+    """活躍工作階段每 120 秒檢查新標題，不等於 RSS 提供即時推播。"""
+    checked_at = datetime.now(TW).strftime('%Y-%m-%d %H:%M:%S')
     items = []
-    for query in queries:
-        try:
-            url = f'https://news.google.com/rss/search?q={quote(query)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant'
-            req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urlopen(req, timeout=8) as response:
-                root = ET.fromstring(response.read())
-            for item in root.findall('./channel/item')[:6]:
-                title = item.findtext('title', '').strip()
-                link = item.findtext('link', '').strip()
-                date = item.findtext('pubDate', '').strip()
-                if title and link:
-                    items.append({'title': title, 'url': link, 'published': date})
-        except Exception:
-            continue
+    succeeded = 0
+    with ThreadPoolExecutor(max_workers=min(len(queries), 3)) as pool:
+        futures = [pool.submit(fetch_one_feed, q) for q in queries]
+        for future in futures:
+            try:
+                items.extend(future.result())
+                succeeded += 1
+            except Exception as exc:
+                logging.warning('新聞 RSS 暫時讀取失敗：%s', type(exc).__name__)
+
     seen = set()
     unique = []
-    for item in items:
-        if item['url'] not in seen:
+    for item in sorted(items, key=lambda x: x['published_ts'], reverse=True):
+        normalized = re.sub(r'\s+-\s+[^-]+$', '', item['title']).strip().casefold()
+        if normalized not in seen:
+            seen.add(normalized)
             unique.append(item)
-            seen.add(item['url'])
-    return unique[:10]
+    return unique[:12], checked_at, succeeded
 
 
 def last_obs(series):
@@ -245,14 +316,29 @@ if not market_df.empty:
                 st.markdown(f"**30 個交易日歷史波動情境（非價格預測）：** 假設價格不變且日報酬波動延續，約為 **{sc['low']:.2f}–{sc['high']:.2f} TWD/GBP**；基準報價 {sc['spot']:.2f}。")
                 st.caption('採最近 90 筆日對數報酬標準差 × √30 與 ±1.96 倍波動幅度；未納入央行決策、突發新聞、趨勢漂移及極端風險，不能當作 95% 實際預測保證。')
 
-st.subheader('📰 每日財經時事與央行動向')
-news = get_news()
-if news:
-    for item in news:
-        st.markdown(f"- [{item['title']}]({item['url']})  ·  {item['published']}")
-    st.caption('Google News RSS 聚合標題；新聞日期與來源請點開核實。新聞不代表已確認的市場因果解釋。')
-else:
-    st.warning('目前無法讀取新聞 RSS；請稍後刷新。')
+@st.fragment(run_every='120s')
+def show_live_news():
+    st.subheader('📰 每日財經時事與央行動向')
+    if st.button('🔄 立即檢查新聞', key='refresh_news'):
+        get_news.clear()  # 只清除新聞快取，不干擾 FRED / Yahoo 的快取
+    news, checked_at, succeeded = get_news(active_news_queries)
+    if news:
+        st.session_state['latest_news'] = news
+    else:
+        news = st.session_state.get('latest_news', [])
+    if succeeded == 0:
+        st.warning('RSS 來源暫時無法連線；下方如有新聞，為本次瀏覽期間的最近成功紀錄。')
+    if news:
+        for item in news:
+            date_label = ('台灣時間' if item['published_ts'] else '來源原始日期')
+            st.markdown(f"- [{item['title']}]({item['url']})  ·  {item['published']}（{date_label}）")
+        st.caption(f'最近檢查：{checked_at}（台灣時間）｜網頁開啟期間每 2 分鐘自動檢查。')
+        st.caption('採用 feedparser + urllib.parse.quote 抓取 Google News RSS。來源非即時推播，可能延遲或漏載。')
+    else:
+        st.warning('目前無法讀取新聞 RSS；可點「立即檢查新聞」稍後重試。')
+
+
+show_live_news()
 
 # SQLite 僅保存在 Streamlit 目前執行環境；重新部署可能遺失。
 DB_PATH = Path(tempfile.gettempdir()) / 'aieconomics_gemini_history.sqlite3'
@@ -288,119 +374,250 @@ def delete_history(record_id):
         conn.execute('DELETE FROM summaries WHERE id = ?', (record_id,))
 
 
-def call_gemini_with_retry(api_key, model, prompt, max_attempts=3):
+class NewsImpact(BaseModel):
+    id: int = Field(description='對應所提供新聞的編號，從 1 開始')
+    stance: Literal['鷹派', '鴿派', '中性', '無法判定'] = Field(description='從標題對貨幣政策立場的判讀')
+    impact: str = Field(description='根據標題做的 30~60 字可能影響分析，需清楚表達不確定性')
+    currency_note: str = Field(description='對美元/台幣或英鎊/台幣的可能方向；不能判斷則明說')
+
+
+class MarketAnalysis(BaseModel):
+    sentiment_score: int = Field(ge=0, le=100, description='市場風險情緒，0 代表風險趨避，50 中性，100 風險偏好')
+    hawkish_score: int = Field(ge=0, le=100, description='政策鷹派程度，0 極鴿派，50 中性，100 極鷹派')
+    sentiment_reason: str = Field(description='解釋兩項分數評分根據與主觀性，40~80 字')
+    overall_summary: str = Field(description='150~220 字的總體經濟短評，依日期與指標做謹慎推論')
+    news_impacts: list[NewsImpact] = Field(description='對應提供之每一則新聞的標題分析')
+
+
+@st.cache_data(ttl=900, max_entries=64, show_spinner=False)
+def generate_summary_cached(prompt, model, key_fingerprint, _api_key):
+    """固定結構化回傳、有限次 SDK retry；相同輸入 15 分鐘重用。"""
     from google import genai
-    from google.genai import errors
-    client = genai.Client(api_key=api_key)
-    status = st.empty()
+    from google.genai import errors, types
+
+    client = genai.Client(
+        api_key=_api_key,
+        http_options=types.HttpOptions(
+            timeout=20000,
+            retry_options=types.HttpRetryOptions(
+                attempts=2, initial_delay=1.0, max_delay=2.0, jitter=0.5,
+                http_status_codes=[408, 429, 500, 502, 503, 504],
+            ),
+        ),
+    )
+
+    def invoke(which_model):
+        options = {
+            'response_mime_type': 'application/json',
+            'response_schema': MarketAnalysis,
+            'max_output_tokens': 2200,
+            'temperature': 0.2,
+        }
+        if which_model.startswith('gemini-3.'):
+            options['thinking_config'] = types.ThinkingConfig(
+                thinking_level='minimal' if 'flash-lite' in which_model else 'low'
+            )
+        response = client.models.generate_content(
+            model=which_model, contents=prompt,
+            config=types.GenerateContentConfig(**options),
+        )
+        if not (response.text or '').strip():
+            raise ValueError('Gemini 未回傳可解析的內容。')
+        # 透過 schema + Pydantic 第二次驗證，避免沒有評分值的結果進入 UI。
+        return MarketAnalysis.model_validate_json(response.text).model_dump()
+
+    chosen = model
     try:
-        for attempt in range(max_attempts):
-            try:
-                status.info(f'Gemini 正在生成摘要（第 {attempt + 1}/{max_attempts} 次）…')
-                response = client.models.generate_content(model=model, contents=prompt)
-                content = (response.text or '').strip()
-                if not content:
-                    raise ValueError('Gemini 未回傳文字，可能受到內容安全限制。')
-                return content
-            except (errors.ServerError, errors.ClientError) as exc:
-                code = getattr(exc, 'code', None)
-                if code is None:
-                    code = getattr(exc, 'status_code', None)
-                try:
-                    code = int(code)
-                except (TypeError, ValueError):
-                    code = None
-                # 429、500、502、503、504 才重試；400、401、403、404 直接回報
-                if code not in (429, 500, 502, 503, 504) or attempt == max_attempts - 1:
-                    raise
-                wait_seconds = 2 ** (attempt + 1)
-                status.warning(f'Gemini 暫時無法服務（HTTP {code}），{wait_seconds} 秒後重試…')
-                time.sleep(wait_seconds)
+        try:
+            analysis = invoke(chosen)
+        except errors.APIError as exc:
+            # 配額 429 不用另一個模型再浪費請求；可用性故障才切換備援。
+            if chosen == 'gemini-3.5-flash-lite' and getattr(exc, 'code', None) in (404, 500, 502, 503, 504):
+                chosen = 'gemini-3.5-flash'
+                analysis = invoke(chosen)
+            else:
+                raise
+        generated_at = datetime.now(TW).strftime('%Y-%m-%d %H:%M:%S')
+        return analysis, chosen, generated_at
     finally:
-        status.empty()
         client.close()
 
 
-st.subheader('🤖 Gemini AI 總體經濟摘要')
-st.caption('使用最新可用數據與新聞標題生成約 200 字短評；新聞標題未核實全文，不能視為市場因果證據。')
+def make_summary_prompt(macro_df, market_df, news):
+    context = []
+    for key in ['美國 CPI 指數', '美國失業率', '美國 10 年期公債殖利率',
+                '美國 2 年期公債殖利率', '聯邦基金有效利率',
+                '日本 10 年期公債殖利率', spread_key]:
+        if key in macro_df:
+            value, dt, _ = last_obs(macro_df[key])
+            if value is not None:
+                context.append(f'{key}: {value:.3f}（觀測日 {dt.date()}）')
+    for key in [USD, GBPUSD, GBPTWD]:
+        if key in market_df:
+            value, dt, _ = last_obs(market_df[key])
+            if value is not None:
+                context.append(f'{key}: {value:.4f}（行情日 {dt.date()}）')
+    for idx, item in enumerate(news[:5], start=1):
+        context.append(f'新聞 #{idx}（標題，未查證全文）：{item["title"]}；發布日期：{item["published"]}')
+    return (
+        '你是嚴謹的總體經濟學新聞分析員。請只根據下方提供的數值、觀測日期和新聞標題，'
+        '以繁體中文回傳符合要求的 JSON 欄位。'
+        'sentiment_score 是市場風險情緒（0 風險趨避／50 中性／100 風險偏好）；'
+        'hawkish_score 是貨幣政策立場（0 鴿派／50 中性／100 鷹派）；'
+        '兩者絕對不可混為一談，且分數是模型對有限標題的主觀估計、不是統計市場指數。'
+        '每則新聞依序標示 id，根據標題分析 stance、impact 與 currency_note。'
+        '非央行或政策消息請標示中性或無法判定，不能亂判成鷹派、鴿派。'
+        '如有 5 則標題，news_impacts 應列出 5 則，不能新增不存在的新聞。'
+        '不得杜撰新聞正文、政策決策、數據或因果；標題不等於已驗證新聞內容。'
+        'CPI 指數不是年通膨率；日本殖利率是月資料，不是即時觀測。'
+        '不必對匯率給出必然漲跌結論，若資訊不足，應明確說明。'
+        'overall_summary 請說明利率、殖利率、通膨、就業、以及 USD/TWD 和 GBP/TWD 可能傳導，'
+        '以用於經濟學課程報告。請勿輸出 JSON 之外的文字。'
+        '\n\n資料：\n' + '\n'.join(context)
+    )
 
-try:
-    init_history()
-    history_available = True
-except (OSError, sqlite3.Error) as exc:
-    history_available = False
-    st.warning(f'目前無法使用歷史紀錄儲存：{exc}')
 
-if st.button('✨ 產生 AI 總體經濟摘要', type='primary'):
-    if not gemini_key:
-        st.warning('請先在 Streamlit Secrets 設定 GEMINI_API_KEY。')
-    elif macro_df.empty:
-        st.warning('需要有效的 FRED API Key 與總經資料才能產生摘要。')
-    else:
-        context = []
-        for key in ['美國 CPI 指數', '美國失業率', '美國 10 年期公債殖利率',
-                    '美國 2 年期公債殖利率', '聯邦基金有效利率',
-                    '日本 10 年期公債殖利率', spread_key]:
-            if key in macro_df:
-                value, dt, _ = last_obs(macro_df[key])
-                if value is not None:
-                    context.append(f'{key}: {value:.3f}（觀測日 {dt.date()}）')
-        for key in [USD, GBPUSD, GBPTWD]:
-            if key in market_df:
-                value, dt, _ = last_obs(market_df[key])
-                if value is not None:
-                    context.append(f'{key}: {value:.4f}（行情日 {dt.date()}）')
-        context.extend('新聞標題（未核實全文）：' + x['title'] + ' / ' + x['published']
-                       for x in news[:5])
-        prompt = (
-            '請以繁體中文撰寫約 200 個中文字的總體經濟短評，重點是美國通膨、就業、利率、'
-            '10Y−2Y 利差，以及美元/台幣與英鎊/台幣的連動，兼顧英國留學換匯者。'
-            '務必區分各指標觀測日與新聞日期；CPI 指數不是通膨率，日本殖利率為月頻；'
-            '新聞標題未驗證全文，不能把標題直接當因果證據；'
-            '不得杜撰政策、數字、即時事件或確定的匯率預測。資料不足請明確指出。'
-            '\n\n資料：\n' + '\n'.join(context)
-        )
-        try:
-            summary = call_gemini_with_retry(gemini_key, gemini_model, prompt)
-            st.success('摘要產生成功！')
-            st.markdown(summary)
-            if history_available:
-                try:
-                    created_at = save_history(gemini_model, summary)
-                    st.caption(f'已加入歷史紀錄｜{created_at}')
-                except (OSError, sqlite3.Error) as exc:
-                    st.warning(f'摘要成功，但無法寫入歷史紀錄：{exc}')
-        except Exception as exc:
-            st.error(f'Gemini 呼叫失敗：{type(exc).__name__}: {exc}')
-            st.info('若為 503，代表模型服務暫時繁忙；若為 404，請確認目前帳號可用的模型名稱。')
+def analysis_as_markdown(result, news):
+    """保存到原有 SQLite 的完整文字；保留新聞標題來源和 AI 判讀。"""
+    lines = [
+        f'**市場風險情緒：{result["sentiment_score"]}/100**（0 風險趨避；100 風險偏好）',
+        f'**政策鷹派程度：{result["hawkish_score"]}/100**（0 鴿派；100 鷹派）',
+        result['sentiment_reason'], '', result['overall_summary'], '',
+        '### 逐條新聞影響判讀',
+    ]
+    for impact in result['news_impacts']:
+        idx = impact['id'] - 1
+        if not (0 <= idx < min(len(news), 5)):
+            continue
+        item = news[idx]
+        lines += [
+            f'**新聞 {idx+1}｜[{item["title"]}]({item["url"]})**｜{impact["stance"]}',
+            impact['impact'],
+            '匯率觀察：' + impact['currency_note'], '',
+        ]
+    lines.append('註：依新聞標題與已知數據分析，非實際全文查證、實測情緒指數或投資建議。')
+    return '\n\n'.join(lines)
 
-st.subheader('🗂️ AI 摘要歷史紀錄')
-st.caption('紀錄儲存在此 Streamlit 執行環境的暫存資料庫；重新部署、容器重建或休眠恢復可能遺失。請下載備份。')
-if history_available:
+
+@st.fragment
+def show_ai_panel():
+    st.subheader('🤖 Gemini AI 市場情緒與新聞衝擊分析')
+    st.caption('新聞每 2 分鐘更新；AI 僅按鈕觸發。對最新 5 則新聞進行鷹鴿派標籤化、0~100 雙指標及逐則分析。')
+    st.caption('情緒分數是以目前所選標題與可用經濟數據作出的模型估計，並非真實交易量或市場調查。')
+
     try:
-        records = load_history()
-        if not records:
-            st.info('目前還沒有摘要紀錄。成功產生摘要後會自動新增。')
-        else:
-            st.write(f'目前有 {len(records)} 筆摘要紀錄')
-            export = [dict(id=r[0], created_at=r[1], model=r[2], summary=r[3]) for r in records]
-            st.download_button('⬇️ 下載全部歷史紀錄（JSON）',
-                               data=json.dumps(export, ensure_ascii=False, indent=2).encode('utf-8'),
-                               file_name='gemini_summary_history.json', mime='application/json')
-            for record_id, created_at, model, summary in records:
-                with st.expander(f'📅 {created_at}｜{model}｜紀錄 #{record_id}'):
-                    st.markdown(summary)
-                    st.download_button('下載此摘要（TXT）', data=summary,
-                                       file_name=f'gemini_summary_{record_id}.txt',
-                                       mime='text/plain', key=f'download_{record_id}')
-                    if st.button('🗑️ 刪除此筆紀錄', key=f'delete_{record_id}'):
-                        delete_history(record_id)
-                        st.rerun()
+        init_history()
+        history_available = True
     except (OSError, sqlite3.Error) as exc:
-        st.warning(f'讀取歷史紀錄失敗：{exc}')
+        history_available = False
+        st.warning(f'目前無法使用歷史紀錄儲存：{exc}')
+
+    if st.button('✨ 產生 AI 市場情緒分析', type='primary', key='generate_summary'):
+        if not gemini_key:
+            st.warning('請先在 Streamlit Secrets 設定 GEMINI_API_KEY。')
+        else:
+            latest_news = st.session_state.get('latest_news', [])
+            if not latest_news:
+                latest_news, _, _ = get_news(active_news_queries)
+            if not latest_news and macro_df.empty:
+                st.warning('新聞與 FRED 總經資料目前都不可用，請稍後重試。')
+            else:
+                sampled_news = latest_news[:5]
+                prompt = make_summary_prompt(macro_df, market_df, sampled_news)
+                signature = hashlib.sha256((gemini_model + '\n' + prompt).encode('utf-8')).hexdigest()
+                try:
+                    with st.spinner('Gemini 正在分析新聞標題、政策立場與匯率影響…'):
+                        fingerprint = hashlib.sha256(gemini_key.encode('utf-8')).hexdigest()
+                        result, used_model, generated_at = generate_summary_cached(
+                            prompt, gemini_model, fingerprint, gemini_key
+                        )
+                    output = analysis_as_markdown(result, sampled_news)
+                    st.session_state['recent_analysis'] = (result, sampled_news, used_model, generated_at)
+                    st.session_state['recent_summary'] = (output, used_model, generated_at)
+                    st.success('分析完成！')
+                    if history_available and st.session_state.get('last_saved_signature') != signature:
+                        try:
+                            save_history(used_model, output)
+                            st.session_state['last_saved_signature'] = signature
+                        except (OSError, sqlite3.Error) as exc:
+                            st.warning(f'分析完成，但無法寫入歷史紀錄：{exc}')
+                except Exception as exc:
+                    code = getattr(exc, 'code', None)
+                    if code == 429:
+                        st.error('Gemini API 已達使用額度／速率限制；請確認 Google AI Studio 的配額。')
+                    elif code in (500, 502, 503, 504):
+                        st.error('Gemini 服務暫時繁忙；請稍後再試。')
+                    elif code in (401, 403):
+                        st.error('Gemini API Key 無效或沒有權限使用選定模型。')
+                    elif code == 404:
+                        st.error('選定的 Gemini 模型不支援或未對這組 API Key 開放。')
+                    else:
+                        logging.warning('Gemini 分析失敗：%s', type(exc).__name__)
+                        st.error(f'分析失敗（{type(exc).__name__}）。請檢查 SDK、回傳 JSON 及部署日誌。')
+                    if 'recent_analysis' in st.session_state:
+                        st.info('保留上一次成功的分析結果。')
+
+    if 'recent_analysis' in st.session_state:
+        analysis, articles, used_model, generated_at = st.session_state['recent_analysis']
+        col1, col2 = st.columns(2)
+        col1.metric('市場風險情緒', f'{analysis["sentiment_score"]} / 100')
+        col2.metric('政策鷹派程度', f'{analysis["hawkish_score"]} / 100')
+        st.progress(analysis['sentiment_score'], text='風險情緒：0 風險趨避 → 50 中性 → 100 風險偏好')
+        st.progress(analysis['hawkish_score'], text='政策立場：0 鴿派 → 50 中性 → 100 鷹派')
+        st.caption(analysis['sentiment_reason'])
+        st.markdown('#### 總體經濟短評')
+        st.markdown(analysis['overall_summary'])
+        st.markdown('#### 逐條新聞衝擊剖析')
+        shown = set()
+        for item in analysis['news_impacts']:
+            idx = item['id'] - 1
+            if idx in shown or not (0 <= idx < len(articles)):
+                continue
+            shown.add(idx)
+            article = articles[idx]
+            with st.expander(f'#{idx+1} {article["title"]}｜{item["stance"]}', expanded=(idx == 0)):
+                st.markdown(f'**[查看新聞原始連結]({article["url"]})**｜{article["published"]}')
+                st.write(item['impact'])
+                st.caption('匯率可能影響：' + item['currency_note'])
+        if len(shown) < len(articles):
+            st.warning('這次模型未對全部標題完成逐條分析，請重新產生一次。')
+        st.caption(f'分析生成時間：{generated_at}（台灣時間）｜模型：{used_model}。')
+        st.caption('分數與標籤皆屬 AI 主觀研判，不代表新聞全文已核實、央行立場認證或可交易的價格預測。')
+        st.download_button('⬇️ 下載本次結構化結果（JSON）',
+                           data=json.dumps(analysis, ensure_ascii=False, indent=2),
+                           file_name='economic_sentiment_analysis.json',
+                           mime='application/json', key='download_analysis_json')
+
+    st.subheader('🗂️ AI 分析歷史紀錄')
+    st.caption('沿用原本 SQLite，執行環境重建時紀錄可能遺失，建議下載備份。')
+    if history_available:
+        try:
+            records = load_history()
+            if not records:
+                st.info('目前尚無分析紀錄。')
+            else:
+                st.write(f'目前有 {len(records)} 筆紀錄')
+                export = [dict(id=r[0], created_at=r[1], model=r[2], summary=r[3]) for r in records]
+                st.download_button('⬇️ 下載所有紀錄（JSON）',
+                                   data=json.dumps(export, ensure_ascii=False, indent=2).encode('utf-8'),
+                                   file_name='gemini_history.json', mime='application/json')
+                for record_id, created_at, model, summary in records:
+                    with st.expander(f'📅 {created_at}｜{model}｜紀錄 #{record_id}'):
+                        st.markdown(summary)
+                        st.download_button('下載此紀錄（TXT）', data=summary,
+                                           file_name=f'gemini_summary_{record_id}.txt',
+                                           mime='text/plain', key=f'download_{record_id}')
+                        if st.button('🗑️ 刪除此筆紀錄', key=f'delete_{record_id}'):
+                            delete_history(record_id)
+                            st.rerun(scope='fragment')
+        except (OSError, sqlite3.Error) as exc:
+            st.warning(f'讀取歷史紀錄失敗：{exc}')
+
+
+show_ai_panel()
 
 with st.expander('資料來源、缺漏與更新頻率'):
-    st.markdown('FRED：美國 CPI／失業率／有效聯邦基金利率通常為月資料；DGS10、DGS2 通常為日資料；日本 10 年公債系列 IRLTLT01JPM156N 為月資料。Yahoo Finance 為市場參考行情，可能延遲或缺漏。新聞為 Google News RSS。')
+    st.markdown('FRED：美國 CPI／失業率／有效聯邦基金利率通常為月資料；DGS10、DGS2 通常為日資料；日本 10 年公債系列 IRLTLT01JPM156N 為月資料。Yahoo Finance 為市場參考行情，可能延遲或缺漏。新聞採用 feedparser 讀取 Google News RSS，開啟頁面時每 2 分鐘檢查一次；來源並非即時推播。')
     if macro_errors:
         st.warning('FRED 部分系列失敗：' + '；'.join(macro_errors.keys()))
     if market_errors:
