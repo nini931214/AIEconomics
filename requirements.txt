@@ -1,0 +1,12 @@
+streamlit>=1.50,<2
+numpy>=1.26,<3
+pandas>=2.2,<3
+plotly>=5.22,<7
+yfinance>=0.2.60,<2
+fredapi>=0.5.2,<1
+feedparser>=6.0.11,<7
+google-genai>=1.50,<3
+pydantic>=2.7,<3
+requests>=2.31,<3
+reportlab>=4.2,<5
+matplotlib>=3.8,<4
